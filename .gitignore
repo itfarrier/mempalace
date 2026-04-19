@@ -36,3 +36,6 @@ venv/
 
 # ChromaDB local data
 *.sqlite3-journal
+
+# Graphify working directory (artifacts copied to .planning/graphs/)
+graphify-out/

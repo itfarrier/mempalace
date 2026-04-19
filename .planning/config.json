@@ -1,0 +1,56 @@
+{
+  "gates": {
+    "confirm_breakdown": true,
+    "confirm_phases": true,
+    "confirm_plan": true,
+    "confirm_project": true,
+    "confirm_roadmap": true,
+    "confirm_transition": true,
+    "execute_next_plan": true,
+    "issues_review": true
+  },
+  "git": {
+    "branching_strategy": "none"
+  },
+  "granularity": "standard",
+  "graphify": {
+    "enabled": true
+  },
+  "hooks": {
+    "context_warnings": true
+  },
+  "mode": "yolo",
+  "model_profile": "inherit",
+  "parallelization": {
+    "enabled": true,
+    "max_concurrent_agents": 999999999,
+    "min_plans_for_parallel": 999999999,
+    "plan_level": true,
+    "skip_checkpoints": true,
+    "task_level": true
+  },
+  "planning": {
+    "commit_docs": true,
+    "search_gitignored": false
+  },
+  "resolve_model_ids": "omit",
+  "safety": {
+    "always_confirm_destructive": false,
+    "always_confirm_external_services": false
+  },
+  "workflow": {
+    "ai_integration_phase": true,
+    "auto_advance": true,
+    "discuss_mode": "discuss",
+    "nyquist_validation": true,
+    "plan_check": true,
+    "research": true,
+    "research_before_questions": true,
+    "security_enforcement": true,
+    "skip_discuss": false,
+    "ui_phase": true,
+    "ui_safety_gate": true,
+    "use_worktrees": true,
+    "verifier": true
+  }
+}
