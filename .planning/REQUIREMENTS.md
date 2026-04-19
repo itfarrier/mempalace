@@ -119,59 +119,66 @@ Explicitly excluded for the initial PR. Documented to prevent scope creep.
 
 ## Traceability
 
-Which phases cover which requirements. **Empty until roadmap creation.**
+Which phases cover which requirements.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| LOC-01 | (pending roadmap) | Pending |
-| LOC-02 | (pending roadmap) | Pending |
-| LOC-03 | (pending roadmap) | Pending |
-| LOC-04 | (pending roadmap) | Pending |
-| LOC-05 | (pending roadmap) | Pending |
-| LOC-06 | (pending roadmap) | Pending |
-| LOC-07 | (pending roadmap) | Pending |
-| NARK-01 | (pending roadmap) | Pending |
-| NARK-02 | (pending roadmap) | Pending |
-| NARK-03 | (pending roadmap) | Pending |
-| NARK-04 | (pending roadmap) | Pending |
-| NARK-05 | (pending roadmap) | Pending |
-| NARK-06 | (pending roadmap) | Pending |
-| NARK-07 | (pending roadmap) | Pending |
-| NARK-08 | (pending roadmap) | Pending |
-| NARK-09 | (pending roadmap) | Pending |
-| TARASK-01 | (pending roadmap) | Pending |
-| TARASK-02 | (pending roadmap) | Pending |
-| TARASK-03 | (pending roadmap) | Pending |
-| TARASK-04 | (pending roadmap) | Pending |
-| TARASK-05 | (pending roadmap) | Pending |
-| TARASK-06 | (pending roadmap) | Pending |
-| TARASK-07 | (pending roadmap) | Pending |
-| QA-01 | (pending roadmap) | Pending |
-| QA-02 | (pending roadmap) | Pending |
-| QA-03 | (pending roadmap) | Pending |
-| QA-04 | (pending roadmap) | Pending |
-| QA-05 | (pending roadmap) | Pending |
-| QA-06 | (pending roadmap) | Pending |
-| QA-07 | (pending roadmap) | Pending |
-| TEST-01 | (pending roadmap) | Pending |
-| TEST-02 | (pending roadmap) | Pending |
-| TEST-03 | (pending roadmap) | Pending |
-| TEST-04 | (pending roadmap) | Pending |
-| TEST-05 | (pending roadmap) | Pending |
-| TEST-06 | (pending roadmap) | Pending |
-| SHIP-01 | (pending roadmap) | Pending |
-| SHIP-02 | (pending roadmap) | Pending |
-| SHIP-03 | (pending roadmap) | Pending |
-| SHIP-04 | (pending roadmap) | Pending |
-| SHIP-05 | (pending roadmap) | Pending |
-| SHIP-06 | (pending roadmap) | Pending |
+| LOC-01 | Phase 1 | Pending |
+| LOC-02 | Phase 3 | Pending |
+| LOC-03 | Phase 1 | Pending |
+| LOC-04 | Phase 2 | Pending |
+| LOC-05 | Phase 5 | Pending |
+| LOC-06 | Phase 1 | Pending |
+| LOC-07 | Phase 1 | Pending |
+| NARK-01 | Phase 1 | Pending |
+| NARK-02 | Phase 1 | Pending |
+| NARK-03 | Phase 1 | Pending |
+| NARK-04 | Phase 1 | Pending |
+| NARK-05 | Phase 2 | Pending |
+| NARK-06 | Phase 2 | Pending |
+| NARK-07 | Phase 2 | Pending |
+| NARK-08 | Phase 2 | Pending |
+| NARK-09 | Phase 2 | Pending |
+| TARASK-01 | Phase 3 | Pending |
+| TARASK-02 | Phase 3 | Pending |
+| TARASK-03 | Phase 3 | Pending |
+| TARASK-04 | Phase 3 | Pending |
+| TARASK-05 | Phase 4 | Pending |
+| TARASK-06 | Phase 4 | Pending |
+| TARASK-07 | Phase 3 | Pending |
+| QA-01 | Phase 2 | Pending |
+| QA-02 | Phase 4 | Pending |
+| QA-03 | Phase 5 | Pending |
+| QA-04 | Phase 5 | Pending |
+| QA-05 | Phase 5 | Pending |
+| QA-06 | Phase 1 | Pending |
+| QA-07 | Phase 5 | Pending |
+| TEST-01 | Phase 5 | Pending |
+| TEST-02 | Phase 5 | Pending |
+| TEST-03 | Phase 5 | Pending |
+| TEST-04 | Phase 5 | Pending |
+| TEST-05 | Phase 5 | Pending |
+| TEST-06 | Phase 5 | Pending |
+| SHIP-01 | Phase 5 | Pending |
+| SHIP-02 | Phase 5 | Pending |
+| SHIP-03 | Phase 5 | Pending |
+| SHIP-04 | Phase 5 | Pending |
+| SHIP-05 | Phase 5 | Pending |
+| SHIP-06 | Phase 5 | Pending |
 
 **Coverage:**
 - v1 requirements: **42 total**
-- Mapped to phases: 0
-- Unmapped: 42 ⚠ (will resolve to 0 after roadmap creation)
+- Mapped to phases: **42**
+- Unmapped: **0** ✓
+
+**Per-phase counts:**
+- Phase 1 (be.json base): 9 reqs (LOC-01, LOC-03, LOC-06, LOC-07, NARK-01..04, QA-06)
+- Phase 2 (be.json entity): 7 reqs (LOC-04, NARK-05..09, QA-01)
+- Phase 3 (be-tarask.json base): 6 reqs (LOC-02, TARASK-01..04, TARASK-07)
+- Phase 4 (be-tarask.json entity): 3 reqs (TARASK-05, TARASK-06, QA-02)
+- Phase 5 (Tests + native review + PR): 17 reqs (LOC-05, QA-03..05, QA-07, TEST-01..06, SHIP-01..06)
 
 ---
 
 *Requirements defined: 2026-04-20*
-*Last updated: 2026-04-20 after initial definition*
+*Last updated: 2026-04-20 after roadmap creation (traceability filled, 100% coverage)*
