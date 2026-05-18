@@ -360,7 +360,10 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii"))
+        finally:
+            os.close(fd)
         return pid_file
     except FileExistsError:
         pass
@@ -378,7 +381,10 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         return None
     try:
         fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii"))
+        finally:
+            os.close(fd)
         return pid_file
     except FileExistsError:
         return None
