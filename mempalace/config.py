@@ -19,6 +19,17 @@ from pathlib import Path
 MAX_NAME_LENGTH = 128
 _SAFE_NAME_RE = re.compile(r"^(?:[^\W_]|[^\W_][\w .'-]{0,126}[^\W_])$")
 
+# MCP clients (e.g. Claude Desktop, WorkBuddy) occasionally relay lone UTF-16
+# surrogates (U+D800–U+DFFF) when proxying binary-in-Unicode or corrupted
+# clipboard input. Python's ``str.encode('utf-8')`` raises on these, which
+# crashes ChromaDB add/upsert with -32000. See issue #1235.
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def strip_lone_surrogates(text: str) -> str:
+    """Replace lone UTF-16 surrogates with U+FFFD so the string is legal UTF-8 (#1235)."""
+    return _LONE_SURROGATE_RE.sub("�", text)
+
 
 def normalize_wing_name(name: str) -> str:
     """Lower-case + collapse separators (`-`, ` `) to `_` for wing slugs.
@@ -79,7 +90,7 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     if "\x00" in value:
         raise ValueError(f"{field_name} contains null bytes")
 
-    return value
+    return strip_lone_surrogates(value)
 
 
 # ISO-8601 temporal validator for knowledge-graph temporal parameters
@@ -175,7 +186,7 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
         raise ValueError(f"content exceeds maximum length of {max_length} characters")
     if "\x00" in value:
         raise ValueError("content contains null bytes")
-    return value
+    return strip_lone_surrogates(value)
 
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")

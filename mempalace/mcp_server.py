@@ -60,6 +60,7 @@ from .config import (  # noqa: E402
     sanitize_name,
     sanitize_content,
     sanitize_iso_temporal,
+    strip_lone_surrogates,
 )
 from .version import __version__  # noqa: E402
 from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
@@ -150,28 +151,6 @@ def _init_logging() -> None:
 
 _init_logging()
 logger = logging.getLogger("mempalace_mcp")
-
-
-def _clean(text: str) -> str:
-    """Remove lone surrogates that break UTF-8 encoding (issue #1235).
-
-    MCP clients (Claude Desktop, WorkBuddy) can emit lone surrogates
-    (``\\udc00``–``\\udfff``) when relaying binary-in-Unicode or
-    corrupted text.  Python's ``str.encode('utf-8')`` raises
-    ``UnicodeEncodeError`` on these; ChromaDB's ``add()`` /
-    ``upsert()`` then crashes with -32000 Internal Error.
-
-    Replace lone surrogates with U+FFFD (REPLACEMENT CHARACTER) so
-    the string is legal UTF-8 while preserving as much content as
-    possible.  Note: ``encode('utf-8', 'surrogatepass')`` also
-    treats suspected paired surrogates (individual ``\ud800``–``\udfff``
-    code points) as lone surrogates, replacing them with U+FFFD.
-    This is correct — a Python ``str`` containing such code points
-    is already corrupt from the perspective of the UTF-8 channel.
-    Properly decoded characters (e.g. a real emoji) contain no
-    surrogates and pass through unchanged.
-    """
-    return text.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
 
 
 def _parse_args():
@@ -916,7 +895,6 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
-    sanitized["clean_query"] = _clean(sanitized["clean_query"])
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
     # here would defeat the fallback — it constructs a PersistentClient
@@ -987,7 +965,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
     if not col:
         return _no_palace()
     try:
-        content = _clean(content)
+        content = strip_lone_surrogates(content)
         results = col.query(
             query_texts=[content],
             n_results=5,
@@ -1144,10 +1122,9 @@ def tool_add_drawer(
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
         content = sanitize_content(content)
-        content = _clean(content)
         if source_file:
-            source_file = _clean(source_file)
-        added_by = _clean(added_by)
+            source_file = strip_lone_surrogates(source_file)
+        added_by = strip_lone_surrogates(added_by)
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -1445,7 +1422,6 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         if content is not None:
             try:
                 new_doc = sanitize_content(content)
-                new_doc = _clean(new_doc)
             except ValueError as e:
                 return {"success": False, "error": str(e)}
 
@@ -1640,7 +1616,6 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
-        entry = _clean(entry)
         topic = sanitize_name(topic, "topic")
     except ValueError as e:
         return {"success": False, "error": str(e)}
