@@ -1,0 +1,323 @@
+# shellcheck shell=bash
+# MEMPALACE ANTIGRAVITY HOOK — shared helpers
+#
+# Sourced by the two Antigravity hook scripts:
+#   * mempal_save_hook_antigravity.sh   (Stop event)
+#   * mempal_wake_hook_antigravity.sh   (PreInvocation event, gated to invocationNum==1)
+#
+# Mirrors the conventions of the existing Claude Code hook scripts
+# (hooks/mempal_save_hook.sh, hooks/mempal_precompact_hook.sh):
+#
+#   * STATE_DIR layout under ~/.mempalace/hook_state/
+#   * MEMPAL_PYTHON resolution order (override -> $PATH -> bare python3)
+#   * MEMPALACE_HOOKS_AUTO_SAVE=false kill switch (config.json fallback)
+#   * sentinel-guarded Python parser via `sed -n 'Np'` (bash 3.2 safe)
+#   * fail-open on internal errors: emit valid JSON and log, never crash
+#     the hook host
+#
+# Antigravity-specific contract differences from Claude / Cursor:
+#
+#   * Antigravity stdin uses camelCase (transcriptPath, conversationId,
+#     workspacePaths, executionNum, terminationReason, fullyIdle,
+#     invocationNum, initialNumSteps), not the snake_case Claude Code
+#     format (session_id, transcript_path, stop_hook_active).
+#   * Antigravity stdout for Stop event MUST be {} on every success path
+#     because { "decision": "continue" } would force the agent into an
+#     infinite re-execution loop. The save hook explicitly refuses to
+#     ever emit the "continue" decision.
+#   * Antigravity stdout for PreInvocation can carry an "injectSteps"
+#     array of { "ephemeralMessage": "..." } objects to inject memory
+#     into the agent's first turn.
+#
+# This file is sourced, not executed, so it intentionally has no
+# shebang. The `# shellcheck shell=bash` directive above tells
+# shellcheck to treat it as bash when run standalone.
+
+# bash 3.2.57 (the macOS default) is the lower bound. Do not use
+# `mapfile`, `readarray`, `declare -A`, or `${var^^}` — none of those
+# exist in 3.2. Use `sed -n 'Np'` for line extraction and case-folding
+# via `tr` instead.
+
+# ── State directory + log path ────────────────────────────────────────
+#
+# Honour MEMPAL_STATE_DIR while keeping the default identical to the
+# Claude Code hooks so a user running both keeps a single state directory
+# (constraint #7 in the integration brief).
+MEMPAL_STATE_DIR="${MEMPAL_STATE_DIR:-$HOME/.mempalace/hook_state}"
+mkdir -p "$MEMPAL_STATE_DIR" 2>/dev/null
+MEMPAL_AGY_LOG="$MEMPAL_STATE_DIR/antigravity_hook.log"
+
+# ── Python interpreter resolution ─────────────────────────────────────
+#
+# Resolution order:
+#   1. $MEMPAL_PYTHON        — explicit user override (absolute path)
+#   2. $(command -v python3) — first python3 on the hook's PATH
+#   3. bare "python3"        — last-resort fallback
+mempal_resolve_python() {
+    local p="${MEMPAL_PYTHON:-}"
+    if [ -n "$p" ] && [ -x "$p" ]; then
+        printf '%s' "$p"
+        return 0
+    fi
+    p="$(command -v python3 2>/dev/null || true)"
+    if [ -n "$p" ]; then
+        printf '%s' "$p"
+        return 0
+    fi
+    printf '%s' "python3"
+}
+MEMPAL_PYTHON_BIN="$(mempal_resolve_python)"
+
+# ── Logging ───────────────────────────────────────────────────────────
+#
+# ISO8601Z timestamps are greppable across timezones.
+mempal_log() {
+    local event="${1:-?}"
+    local conv="${2:-unknown}"
+    local msg="${3:-}"
+    local ts
+    ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '[%s] [event=%s] [conv=%s] %s\n' "$ts" "$event" "$conv" "$msg" \
+        >> "$MEMPAL_AGY_LOG" 2>/dev/null
+}
+
+# ── Kill switch ───────────────────────────────────────────────────────
+#
+# Disabled if ANY of:
+#   * MEMPAL_DISABLE_HOOK is a truthy string
+#   * MEMPALACE_HOOKS_AUTO_SAVE is false/0/no
+#   * ~/.mempalace/config.json sets hooks.auto_save: false
+#   * ~/.mempalace/ directory does not exist (user nuked the palace)
+#
+# Returns 0 (kill switch tripped, hook should short-circuit) or non-zero
+# (proceed normally).
+mempal_kill_switch_tripped() {
+    # Palace nuke is the strongest signal: respect it before touching
+    # disk for state, logging, etc.
+    if [ ! -d "$HOME/.mempalace" ]; then
+        return 0
+    fi
+
+    case "${MEMPAL_DISABLE_HOOK:-}" in
+        1|true|TRUE|yes|YES) return 0 ;;
+    esac
+
+    case "${MEMPALACE_HOOKS_AUTO_SAVE:-}" in
+        false|FALSE|0|no|NO) return 0 ;;
+    esac
+
+    local cfg="$HOME/.mempalace/config.json"
+    if [ -f "$cfg" ]; then
+        local auto
+        auto=$("$MEMPAL_PYTHON_BIN" -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    print(str(cfg.get('hooks', {}).get('auto_save', True)).lower())
+except Exception:
+    print('true')
+" "$cfg" 2>/dev/null)
+        if [ "$auto" = "false" ]; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# ── camelCase JSON parser (Antigravity stdin) ────────────────────────
+#
+# Reads JSON from stdin once and prints a sanitized, sentinel-bracketed
+# block of fields the bash side can grab via `sed -n 'Np'`. Why a
+# sentinel and per-line layout: bash 3.2 doesn't have `mapfile` or
+# `readarray`, and `eval`-on-shell-var is the wrong shape (every value
+# is user-controllable JSON). Sentinel + line offset is the same pattern
+# the existing Claude Code hook (hooks/mempal_save_hook.sh) uses.
+#
+# Output layout (one field per line; line numbers are stable and the
+# fields are documented in STDIN_SHAPE.md):
+#
+#   line 1: __MEMPAL_PARSE_OK__       — sentinel (parse success marker)
+#   line 2: conversationId            — sanitized to [A-Za-z0-9._-]
+#   line 3: transcriptPath            — sanitized to a safe path charset
+#   line 4: workspacePath             — workspacePaths[0], sanitized
+#   line 5: artifactDirectoryPath     — sanitized
+#   line 6: executionNum              — integer, default 0
+#   line 7: terminationReason         — sanitized to [a-z_]
+#   line 8: fullyIdle                 — "True" or "False" (string)
+#   line 9: invocationNum             — integer, default 0
+#   line 10: initialNumSteps          — integer, default 0
+#
+# The sanitizers are defense-in-depth: every field is also vetted by
+# the Python json.load step, but we still strip shell-meaningful chars
+# from any field a downstream bash variable might interpolate, so that
+# a hostile / malformed harness payload cannot inject command tokens.
+#
+# Stderr from Python is captured to last_python_err.log at mode 0600 so
+# operators can debug parse failures without re-firing the hook. The
+# umask 077 on the inner subshell creates the file at 0600 atomically;
+# the explicit chmod 600 below is a belt-and-suspenders guard if a
+# future edit ever drops the umask.
+mempal_parse_stdin() {
+    local input="$1"
+    (
+        umask 077
+        printf '%s' "$input" | "$MEMPAL_PYTHON_BIN" -c "
+import sys, json, re
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = {}
+
+def safe(s, allowed=r'[^a-zA-Z0-9_/.\-~]'):
+    return re.sub(allowed, '', str(s))
+
+def safe_id(s):
+    return re.sub(r'[^a-zA-Z0-9._-]', '', str(s))
+
+def safe_int(v, default=0):
+    try:
+        n = int(v)
+        return n if n >= 0 else default
+    except Exception:
+        return default
+
+def safe_lower_alpha_underscore(s):
+    return re.sub(r'[^a-z_]', '', str(s).lower())
+
+conv_id = safe_id(data.get('conversationId', ''))
+transcript = safe(data.get('transcriptPath', ''))
+wp_arr = data.get('workspacePaths', [])
+if isinstance(wp_arr, list) and wp_arr:
+    workspace = safe(wp_arr[0])
+else:
+    workspace = ''
+artifact = safe(data.get('artifactDirectoryPath', ''))
+execution_num = safe_int(data.get('executionNum', 0))
+termination_reason = safe_lower_alpha_underscore(data.get('terminationReason', ''))
+fully_idle_raw = data.get('fullyIdle', None)
+if fully_idle_raw is True or str(fully_idle_raw).lower() in ('true', '1', 'yes'):
+    fully_idle = 'True'
+else:
+    fully_idle = 'False'
+invocation_num = safe_int(data.get('invocationNum', 0))
+initial_num_steps = safe_int(data.get('initialNumSteps', 0))
+
+print('__MEMPAL_PARSE_OK__')
+print(conv_id)
+print(transcript)
+print(workspace)
+print(artifact)
+print(execution_num)
+print(termination_reason)
+print(fully_idle)
+print(invocation_num)
+print(initial_num_steps)
+" 2>"$MEMPAL_STATE_DIR/antigravity_last_python_err.log"
+    )
+    # Tidy up the err log: keep it iff non-empty (failure happened).
+    if [ -s "$MEMPAL_STATE_DIR/antigravity_last_python_err.log" ]; then
+        chmod 600 "$MEMPAL_STATE_DIR/antigravity_last_python_err.log" 2>/dev/null
+    else
+        rm -f "$MEMPAL_STATE_DIR/antigravity_last_python_err.log" 2>/dev/null
+    fi
+}
+
+# ── Transcript path validator ─────────────────────────────────────────
+#
+# Mirrors mempalace.hooks_cli._validate_transcript_path: rejects empty,
+# non-jsonl/json suffixes, and any `..` traversal segment.
+mempal_is_valid_transcript_path() {
+    local path="$1"
+    [ -n "$path" ] || return 1
+    case "$path" in
+        *.json|*.jsonl) ;;
+        *) return 1 ;;
+    esac
+    case "/$path/" in
+        */../*) return 1 ;;
+    esac
+    return 0
+}
+
+# ── Wing inference ────────────────────────────────────────────────────
+#
+# Takes the first workspace path from workspacePaths[] (already
+# extracted into $1) and derives a `wing_<slug>` name from its leaf
+# directory. Hyphens become underscores; spaces become underscores.
+# Empty input yields wing_sessions, matching mempalace.hooks_cli's
+# fallback.
+mempal_infer_wing() {
+    local workspace="$1"
+    if [ -z "$workspace" ]; then
+        printf 'wing_sessions'
+        return 0
+    fi
+    # Strip trailing slashes
+    while [ "${workspace}" != "${workspace%/}" ]; do
+        workspace="${workspace%/}"
+    done
+    if [ -z "$workspace" ]; then
+        printf 'wing_sessions'
+        return 0
+    fi
+    local leaf="${workspace##*/}"
+    if [ -z "$leaf" ]; then
+        printf 'wing_sessions'
+        return 0
+    fi
+    # Lowercase + hyphens-to-underscores. tr is bash 3.2 safe; ${var^^}
+    # / ${var//-/_} on a fresh expansion are bash 4+ only.
+    local slug
+    slug=$(printf '%s' "$leaf" | tr 'A-Z' 'a-z' | tr ' -' '__')
+    printf 'wing_%s' "$slug"
+}
+
+# ── Save-interval floor ───────────────────────────────────────────────
+#
+# Reads MEMPAL_SAVE_INTERVAL from the environment, floors it to >= 1
+# so that `count % interval` cannot divide by zero. We hit the
+# divide-by-zero shape on the Cursor PR review; this guards explicitly.
+mempal_save_interval() {
+    local raw="${MEMPAL_SAVE_INTERVAL:-15}"
+    case "$raw" in
+        ''|*[!0-9]*) printf '15'; return 0 ;;
+    esac
+    if [ "$raw" -lt 1 ] 2>/dev/null; then
+        printf '15'
+        return 0
+    fi
+    printf '%s' "$raw"
+}
+
+# ── Fail-open emitters ────────────────────────────────────────────────
+#
+# Every code path in both hooks must terminate by calling exactly one
+# of these emitters. Stdout is JSON. Exit status is always 0 — the hook
+# never blocks the user's IDE on its own failure (constraint #2).
+#
+# CRITICAL: mempal_emit_stop_pass MUST NEVER emit
+# {"decision":"continue"} — that would force the agent to keep running
+# instead of letting the turn end. Antigravity treats any value other
+# than "continue" (including `{}`) as "allow the stop". We enforce this
+# by hard-coding the empty object output here.
+mempal_emit_stop_pass() {
+    printf '{}\n'
+}
+
+mempal_emit_wake_inject() {
+    local message="$1"
+    if [ -z "$message" ]; then
+        printf '{}\n'
+        return 0
+    fi
+    # Encode the message as JSON via Python so embedded quotes / newlines
+    # / control chars don't corrupt the output.
+    "$MEMPAL_PYTHON_BIN" -c "
+import json, sys
+msg = sys.argv[1]
+print(json.dumps({'injectSteps': [{'ephemeralMessage': msg}]}))
+" "$message" 2>/dev/null || printf '{}\n'
+}
