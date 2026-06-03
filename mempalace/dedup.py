@@ -7,7 +7,7 @@ accumulate. This module finds drawers from the same source_file that
 are too similar (cosine distance < threshold), keeps the longest/richest
 version, and deletes the rest.
 
-No API calls — uses ChromaDB's built-in embedding similarity.
+No API calls — uses the configured local vector backend's similarity search.
 
 Usage (standalone):
     python -m mempalace.dedup                          # dedup all
@@ -27,7 +27,7 @@ import os
 import time
 from collections import defaultdict
 
-from .backends.chroma import ChromaBackend
+from .palace import get_collection
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -130,7 +130,7 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
 def show_stats(palace_path=None):
     """Show duplication statistics without making changes."""
     palace_path = palace_path or _get_palace_path()
-    col = ChromaBackend().get_collection(palace_path, COLLECTION_NAME)
+    col = get_collection(palace_path, COLLECTION_NAME)
 
     groups = get_source_groups(col)
 
@@ -162,7 +162,7 @@ def dedup_palace(
     print("  MemPalace Deduplicator")
     print(f"{'=' * 55}")
 
-    col = ChromaBackend().get_collection(palace_path, COLLECTION_NAME)
+    col = get_collection(palace_path, COLLECTION_NAME)
 
     print(f"  Palace: {palace_path}")
     print(f"  Drawers: {col.count():,}")

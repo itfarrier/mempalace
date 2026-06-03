@@ -181,6 +181,66 @@ def test_chroma_detect_matches_palace_with_chroma_sqlite(tmp_path):
     assert ChromaBackend.detect(str(tmp_path.parent)) is False
 
 
+def test_chroma_lexical_search_uses_sqlite_fts_not_full_collection_scan(tmp_path):
+    db_path = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE collections (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE segments (id INTEGER PRIMARY KEY, collection INTEGER NOT NULL);
+        CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id INTEGER NOT NULL, created_at TEXT);
+        CREATE TABLE embedding_metadata (
+            id INTEGER,
+            key TEXT,
+            string_value TEXT,
+            int_value INTEGER,
+            float_value REAL,
+            bool_value INTEGER
+        );
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value);
+        """
+    )
+    conn.execute("INSERT INTO collections(id, name) VALUES (1, 'mempalace_drawers')")
+    conn.execute("INSERT INTO segments(id, collection) VALUES (1, 1)")
+    ids = list(range(1, 14))
+    for emb_id in ids:
+        wing = "target" if emb_id == 13 else "old"
+        doc = "needle shared lexical note"
+        conn.execute(
+            "INSERT INTO embeddings(id, segment_id, created_at) VALUES (?, 1, ?)",
+            (emb_id, f"2026-01-01T00:00:{emb_id:02d}"),
+        )
+        conn.execute(
+            "INSERT INTO embedding_fulltext_search(rowid, string_value) VALUES (?, ?)",
+            (emb_id, doc),
+        )
+        conn.execute(
+            "INSERT INTO embedding_metadata(id, key, string_value) VALUES (?, 'chroma:document', ?)",
+            (emb_id, doc),
+        )
+        conn.execute(
+            "INSERT INTO embedding_metadata(id, key, string_value) VALUES (?, 'wing', ?)",
+            (emb_id, wing),
+        )
+    conn.commit()
+    conn.close()
+
+    class _NoScanCollection:
+        name = "mempalace_drawers"
+
+        def count(self):
+            raise AssertionError("lexical_search should use Chroma sqlite FTS")
+
+        def get(self, **_kwargs):
+            raise AssertionError("lexical_search should use Chroma sqlite FTS")
+
+    collection = ChromaCollection(_NoScanCollection(), palace_path=str(tmp_path))
+
+    hits = collection.lexical_search(query="needle", n_results=1, where={"wing": "target"}).hits
+
+    assert [hit.metadata["wing"] for hit in hits] == ["target"]
+
+
 def test_query_rejects_missing_input():
     fake = _FakeCollection()
     collection = ChromaCollection(fake)

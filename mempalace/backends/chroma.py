@@ -4,8 +4,10 @@ import contextlib
 import datetime as _dt
 import json
 import logging
+import math
 import os
 import pickle
+import re
 import sqlite3
 from numbers import Integral
 from pathlib import Path
@@ -20,6 +22,8 @@ from .base import (
     CollectionNotInitializedError,
     GetResult,
     HealthStatus,
+    LexicalHit,
+    LexicalResult,
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
@@ -33,6 +37,7 @@ logger = logging.getLogger(__name__)
 _REQUIRED_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains"})
 _OPTIONAL_OPERATORS = frozenset({"$gt", "$gte", "$lt", "$lte"})
 _SUPPORTED_OPERATORS = _REQUIRED_OPERATORS | _OPTIONAL_OPERATORS
+_TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
 # A healthy HNSW payload should keep link_lists.bin proportional to
 # data_level0.bin. When link_lists.bin grows orders of magnitude larger than
@@ -157,6 +162,127 @@ def _validate_where(where: Optional[dict]) -> None:
                 stack.append(v)
             elif isinstance(v, list):
                 stack.extend(x for x in v if isinstance(x, dict))
+
+
+def _tokenize(text: str) -> list[str]:
+    if not text:
+        return []
+    return _TOKEN_RE.findall(text.lower())
+
+
+def _bm25_scores(
+    query: str,
+    documents: list[str],
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> list[float]:
+    query_terms = set(_tokenize(query))
+    n_docs = len(documents)
+    if not query_terms or n_docs == 0:
+        return [0.0] * n_docs
+
+    tokenized = [_tokenize(doc) for doc in documents]
+    doc_lens = [len(toks) for toks in tokenized]
+    if not any(doc_lens):
+        return [0.0] * n_docs
+    avgdl = sum(doc_lens) / n_docs or 1.0
+
+    df = {term: 0 for term in query_terms}
+    for toks in tokenized:
+        for term in set(toks) & query_terms:
+            df[term] += 1
+
+    idf = {
+        term: math.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1.0) for term in query_terms
+    }
+
+    scores = []
+    for toks, dl in zip(tokenized, doc_lens):
+        if dl == 0:
+            scores.append(0.0)
+            continue
+        tf: dict[str, int] = {}
+        for token in toks:
+            if token in query_terms:
+                tf[token] = tf.get(token, 0) + 1
+        score = 0.0
+        for term, freq in tf.items():
+            num = freq * (k1 + 1)
+            den = freq + k1 * (1 - b + b * dl / avgdl)
+            score += idf[term] * num / den
+        scores.append(score)
+    return scores
+
+
+def _coerce_metadata_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return int(value)
+    return value
+
+
+def _compare_metadata(actual: Any, op: str, expected: Any) -> bool:
+    actual = _coerce_metadata_value(actual)
+    expected = _coerce_metadata_value(expected)
+    if op == "$eq":
+        return actual == expected
+    if op == "$ne":
+        return actual != expected
+    if op == "$in":
+        return actual in (expected or [])
+    if op == "$nin":
+        return actual not in (expected or [])
+    if op == "$contains":
+        return str(expected) in str(actual or "")
+    try:
+        if op == "$gt":
+            return actual > expected
+        if op == "$gte":
+            return actual >= expected
+        if op == "$lt":
+            return actual < expected
+        if op == "$lte":
+            return actual <= expected
+    except TypeError:
+        return False
+    raise UnsupportedFilterError(f"operator {op!r} not supported by chroma backend")
+
+
+def _matches_where(meta: dict, where: Optional[dict]) -> bool:
+    if not where:
+        return True
+    if not isinstance(where, dict):
+        return False
+    for key, expected in where.items():
+        if key == "$and":
+            if not all(_matches_where(meta, clause) for clause in expected or []):
+                return False
+            continue
+        if key == "$or":
+            if not any(_matches_where(meta, clause) for clause in expected or []):
+                return False
+            continue
+        if key.startswith("$"):
+            raise UnsupportedFilterError(f"operator {key!r} not supported by chroma backend")
+        actual = meta.get(key)
+        if isinstance(expected, dict):
+            for op, operand in expected.items():
+                if not _compare_metadata(actual, op, operand):
+                    return False
+        elif actual != expected:
+            return False
+    return True
+
+
+def _metadata_cell_value(sval, ival, fval, bval):
+    if sval is not None:
+        return sval
+    if ival is not None:
+        return ival
+    if fval is not None:
+        return fval
+    if bval is not None:
+        return bool(bval)
+    return None
 
 
 def _segment_appears_healthy(seg_dir: str) -> bool:
@@ -1226,6 +1352,230 @@ class ChromaCollection(BaseCollection):
     def count(self):
         return self._collection.count()
 
+    def lexical_search(
+        self,
+        *,
+        query: str,
+        n_results: int = 10,
+        where: Optional[dict] = None,
+    ) -> LexicalResult:
+        """Return lexical BM25 candidates for this collection.
+
+        This is the normal healthy-Chroma implementation behind the optional
+        backend capability. The HNSW-disabled fallback in ``searcher.py`` still
+        reads ``chroma.sqlite3`` directly and remains Chroma-only.
+        """
+        _validate_where(where)
+        sqlite_hits = self._lexical_search_via_sqlite(query=query, n_results=n_results, where=where)
+        if sqlite_hits is not None:
+            return LexicalResult(hits=sqlite_hits)
+
+        # Directly-constructed ChromaCollection test doubles may not carry a
+        # palace path. Keep lexical_search usable in that shape, but normal
+        # MemPalace paths above use Chroma's FTS table instead of scanning every
+        # drawer through the Python client.
+        total = self.count()
+        docs: list[str] = []
+        metas: list[dict] = []
+        ids: list[str] = []
+        offset = 0
+        batch_size = 1000
+        while offset < total:
+            kwargs: dict[str, Any] = {
+                "include": ["documents", "metadatas"],
+                "limit": batch_size,
+                "offset": offset,
+            }
+            if where:
+                kwargs["where"] = where
+            batch = self.get(**kwargs)
+            if not batch.ids:
+                break
+            ids.extend(batch.ids)
+            docs.extend(doc or "" for doc in batch.documents)
+            metas.extend(meta or {} for meta in batch.metadatas)
+            offset += len(batch.ids)
+
+        scores = _bm25_scores(query, docs)
+        hits = [
+            LexicalHit(id=doc_id, document=doc, metadata=meta, score=float(score))
+            for doc_id, doc, meta, score in zip(ids, docs, metas, scores)
+            if score > 0
+        ]
+        hits.sort(key=lambda hit: hit.score, reverse=True)
+        return LexicalResult(hits=hits[:n_results])
+
+    def _collection_name(self) -> Optional[str]:
+        name = getattr(self._collection, "name", None)
+        if callable(name):
+            try:
+                name = name()
+            except TypeError:
+                name = None
+        return str(name) if name else None
+
+    def _lexical_search_via_sqlite(
+        self,
+        *,
+        query: str,
+        n_results: int,
+        where: Optional[dict],
+        max_candidates: int = 500,
+    ) -> Optional[list[LexicalHit]]:
+        if not self._palace_path:
+            return None
+        db_path = os.path.join(self._palace_path, "chroma.sqlite3")
+        if not os.path.isfile(db_path):
+            return []
+        collection_name = self._collection_name()
+        if not collection_name:
+            return []
+
+        tokens = [t for t in _tokenize(query) if len(t) >= 3]
+        use_recency_fallback = not tokens
+        candidate_ids: list[int] = []
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            logger.debug("Chroma lexical sqlite open failed", exc_info=True)
+            return []
+
+        try:
+            if tokens:
+                fts_query = " OR ".join(tokens)
+                # If a metadata filter is present, do not cap before filtering:
+                # otherwise a common term can fill the window with wrong-scope
+                # rows and hide valid scoped hits later in the FTS result set.
+                limit_sql = "" if where else "LIMIT ?"
+                params = [fts_query, collection_name]
+                if not where:
+                    params.append(max(max_candidates, n_results))
+                try:
+                    rows = conn.execute(
+                        f"""
+                        SELECT embedding_fulltext_search.rowid
+                        FROM embedding_fulltext_search
+                        JOIN embeddings e ON e.id = embedding_fulltext_search.rowid
+                        JOIN segments s ON e.segment_id = s.id
+                        JOIN collections c ON s.collection = c.id
+                        WHERE embedding_fulltext_search MATCH ?
+                          AND c.name = ?
+                        {limit_sql}
+                        """,
+                        params,
+                    ).fetchall()
+                    candidate_ids = [int(row[0]) for row in rows]
+                except sqlite3.Error:
+                    logger.debug(
+                        "Chroma lexical FTS query failed; using recency fallback", exc_info=True
+                    )
+                    use_recency_fallback = True
+
+            if not candidate_ids and use_recency_fallback:
+                order_expr = "e.created_at DESC"
+                try:
+                    rows = conn.execute(
+                        f"""
+                        SELECT e.id
+                        FROM embeddings e
+                        JOIN segments s ON e.segment_id = s.id
+                        JOIN collections c ON s.collection = c.id
+                        WHERE c.name = ?
+                        ORDER BY {order_expr}
+                        LIMIT ?
+                        """,
+                        (collection_name, max(max_candidates, n_results)),
+                    ).fetchall()
+                except sqlite3.Error:
+                    logger.debug(
+                        "Chroma lexical recency fallback failed; ordering by id", exc_info=True
+                    )
+                    rows = conn.execute(
+                        """
+                        SELECT e.id
+                        FROM embeddings e
+                        JOIN segments s ON e.segment_id = s.id
+                        JOIN collections c ON s.collection = c.id
+                        WHERE c.name = ?
+                        ORDER BY e.id DESC
+                        LIMIT ?
+                        """,
+                        (collection_name, max(max_candidates, n_results)),
+                    ).fetchall()
+                candidate_ids = [int(row[0]) for row in rows]
+
+            if not candidate_ids:
+                return []
+
+            meta_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(embedding_metadata)").fetchall()
+            }
+            value_columns = [
+                col
+                for col in ("string_value", "int_value", "float_value", "bool_value")
+                if col in meta_columns
+            ]
+            if not value_columns:
+                return []
+            meta_rows = []
+            for start in range(0, len(candidate_ids), 900):
+                chunk_ids = candidate_ids[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk_ids)
+                meta_rows.extend(
+                    conn.execute(
+                        f"""
+                        SELECT id, key, {", ".join(value_columns)}
+                        FROM embedding_metadata
+                        WHERE id IN ({placeholders})
+                        """,
+                        chunk_ids,
+                    ).fetchall()
+                )
+        except sqlite3.Error:
+            logger.debug("Chroma lexical sqlite read failed", exc_info=True)
+            return []
+        finally:
+            conn.close()
+
+        drawers: dict[int, dict] = {}
+        for row in meta_rows:
+            emb_id = int(row["id"])
+            key = row["key"]
+            values = {col: row[col] if col in row.keys() else None for col in value_columns}
+            value = _metadata_cell_value(
+                values.get("string_value"),
+                values.get("int_value"),
+                values.get("float_value"),
+                values.get("bool_value"),
+            )
+            drawer = drawers.setdefault(emb_id, {"metadata": {}, "document": ""})
+            if key == "chroma:document":
+                drawer["document"] = str(value or "")
+            else:
+                drawer["metadata"][key] = value
+
+        ordered = []
+        for emb_id in candidate_ids:
+            drawer = drawers.get(emb_id)
+            if drawer is None:
+                continue
+            meta = drawer["metadata"]
+            if not _matches_where(meta, where):
+                continue
+            ordered.append((emb_id, drawer["document"], meta))
+
+        docs = [doc for _, doc, _ in ordered]
+        scores = _bm25_scores(query, docs)
+        hits = [
+            LexicalHit(id=str(emb_id), document=doc, metadata=meta, score=float(score))
+            for (emb_id, doc, meta), score in zip(ordered, scores)
+            if score > 0
+        ]
+        hits.sort(key=lambda hit: hit.score, reverse=True)
+        return hits[:n_results]
+
     @property
     def metadata(self) -> dict:
         """Pass-through to the underlying ChromaDB collection's metadata.
@@ -1264,6 +1614,7 @@ class ChromaBackend(BaseBackend):
             "supports_embeddings_out",
             "supports_metadata_filters",
             "supports_contains_fast",
+            "supports_lexical_search",
             "local_mode",
         }
     )

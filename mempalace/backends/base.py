@@ -58,6 +58,14 @@ class UnsupportedFilterError(BackendError):
     """
 
 
+class UnsupportedCapabilityError(BackendError):
+    """Raised when a backend does not implement an optional capability."""
+
+
+class BackendMismatchError(BackendError):
+    """Raised when a selected backend does not match existing palace artifacts."""
+
+
 class DimensionMismatchError(BackendError):
     """Raised when the embedding dimension on write does not match the collection."""
 
@@ -177,6 +185,23 @@ class GetResult(_DictCompatMixin):
         return cls(ids=[], documents=[], metadatas=[], embeddings=None)
 
 
+@dataclass(frozen=True)
+class LexicalHit:
+    """One hit from backend lexical candidate search."""
+
+    id: str
+    document: str
+    metadata: dict
+    score: float
+
+
+@dataclass(frozen=True)
+class LexicalResult:
+    """Typed return from ``BaseCollection.lexical_search``."""
+
+    hits: list[LexicalHit]
+
+
 # ---------------------------------------------------------------------------
 # Collection contract
 # ---------------------------------------------------------------------------
@@ -252,6 +277,15 @@ class BaseCollection(ABC):
 
     def health(self) -> HealthStatus:
         return HealthStatus.healthy()
+
+    def lexical_search(
+        self,
+        *,
+        query: str,
+        n_results: int = 10,
+        where: Optional[dict] = None,
+    ) -> LexicalResult:
+        raise UnsupportedCapabilityError("backend does not support lexical_search")
 
     def update(
         self,

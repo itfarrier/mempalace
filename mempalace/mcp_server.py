@@ -72,6 +72,7 @@ from .backends.chroma import (  # noqa: E402
     _pin_hnsw_threads,
     hnsw_capacity_status,
 )
+from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
 from .palace_graph import (  # noqa: E402
@@ -160,6 +161,11 @@ def _parse_args():
         metavar="PATH",
         help="Path to the palace directory (overrides config file and env var)",
     )
+    parser.add_argument(
+        "--backend",
+        metavar="NAME",
+        help="Storage backend to use (default: config/env/detected/chroma)",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
@@ -170,6 +176,13 @@ _args = _parse_args()
 
 if _args.palace:
     os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(_args.palace)
+if _args.backend:
+    backend_name = str(_args.backend).strip().lower()
+    from .backends import get_backend_class  # noqa: E402
+
+    get_backend_class(backend_name)
+    os.environ["MEMPALACE_BACKEND_EXPLICIT"] = backend_name
+    os.environ["MEMPALACE_BACKEND"] = backend_name
 
 _config = MempalaceConfig()
 
@@ -289,6 +302,9 @@ def _call_kg(op):
 
 _client_cache = None
 _collection_cache = None
+_collection_cache_backend = None
+_collection_cache_palace = None
+_collection_open_error = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
 
@@ -313,21 +329,27 @@ def _force_chroma_cache_reset() -> None:
     global \
         _client_cache, \
         _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error, \
         _palace_db_inode, \
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
     _client_cache = None
     _collection_cache = None
+    _collection_cache_backend = None
+    _collection_cache_palace = None
+    _collection_open_error = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
     _metadata_cache = None
     _metadata_cache_time = 0
     try:
-        from .palace import _DEFAULT_BACKEND
+        from .palace import get_backend_for_palace
 
-        _DEFAULT_BACKEND._clients.pop(_config.palace_path, None)
-        _DEFAULT_BACKEND._freshness.pop(_config.palace_path, None)
+        backend = get_backend_for_palace(_config.palace_path)
+        backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
     except Exception:
         pass
 
@@ -356,6 +378,11 @@ def _refresh_vector_disabled_flag() -> None:
     would defeat the point.
     """
     global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
+    if not _is_chroma_backend():
+        _vector_disabled = False
+        _vector_disabled_reason = ""
+        _vector_capacity_status = None
+        return
     try:
         info = hnsw_capacity_status(_config.palace_path, _config.collection_name)
     except Exception:
@@ -447,10 +474,15 @@ def _get_client():
     global \
         _client_cache, \
         _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error, \
         _palace_db_inode, \
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
+    if not _is_chroma_backend():
+        raise RuntimeError("_get_client is only available for the Chroma backend")
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     try:
         st = os.stat(db_path)
@@ -467,6 +499,9 @@ def _get_client():
     if not os.path.isfile(db_path) and _collection_cache is not None:
         _client_cache = None
         _collection_cache = None
+        _collection_cache_backend = None
+        _collection_cache_palace = None
+        _collection_open_error = None
         _palace_db_inode = 0
         _palace_db_mtime = 0.0
         # Fall through to normal reconnect which will handle missing DB
@@ -482,6 +517,9 @@ def _get_client():
         _refresh_vector_disabled_flag()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
+        _collection_cache_backend = None
+        _collection_cache_palace = None
+        _collection_open_error = None
         _metadata_cache = None
         _metadata_cache_time = 0
         _palace_db_inode = current_inode
@@ -490,7 +528,7 @@ def _get_client():
 
 
 def _get_collection(create=False):
-    """Return the ChromaDB collection, caching the client between calls.
+    """Return the configured backend collection, caching handles between calls.
 
     On failure, log the exception and retry once after clearing the client
     and collection caches. Tools were silently returning ``None`` when a
@@ -501,9 +539,103 @@ def _get_collection(create=False):
     ``quarantine_stale_hnsw`` per #1322), so the second attempt heals the
     common stale-handle / stale-HNSW case automatically.
     """
-    global _client_cache, _collection_cache, _metadata_cache, _metadata_cache_time
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _metadata_cache, \
+        _metadata_cache_time
+    try:
+        backend_name = _selected_backend_name()
+    except (BackendMismatchError, KeyError) as exc:
+        logger.warning("backend resolution failed for %s: %s", _config.palace_path, exc)
+        _collection_open_error = {
+            "error": "Backend mismatch"
+            if isinstance(exc, BackendMismatchError)
+            else "Unknown backend",
+            "details": str(exc),
+            "hint": "Select the matching backend or use a fresh palace directory.",
+        }
+        _collection_cache = None
+        _collection_cache_backend = None
+        _collection_cache_palace = None
+        return None
+
+    if backend_name != "chroma":
+        for attempt in range(2):
+            try:
+                if (
+                    _collection_cache is not None
+                    and _collection_cache_backend == backend_name
+                    and _collection_cache_palace == _config.palace_path
+                ):
+                    _collection_open_error = None
+                    return _collection_cache
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                if _collection_cache is None:
+                    from .palace import get_collection as palace_get_collection
+
+                    _collection_cache = palace_get_collection(
+                        _config.palace_path,
+                        collection_name=_config.collection_name,
+                        create=create,
+                        backend=backend_name,
+                    )
+                    _collection_cache_backend = backend_name
+                    _collection_cache_palace = _config.palace_path
+                    _collection_open_error = None
+                    _metadata_cache = None
+                    _metadata_cache_time = 0
+                return _collection_cache
+            except (BackendMismatchError, KeyError) as exc:
+                logger.warning("backend open failed for %s: %s", _config.palace_path, exc)
+                _collection_open_error = {
+                    "error": "Backend mismatch"
+                    if isinstance(exc, BackendMismatchError)
+                    else "Unknown backend",
+                    "details": str(exc),
+                    "hint": "Select the matching backend or use a fresh palace directory.",
+                }
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _metadata_cache = None
+                _metadata_cache_time = 0
+                return None
+            except Exception:
+                logger.exception(
+                    "_get_collection generic attempt %d/2 failed (palace=%s, create=%s)",
+                    attempt + 1,
+                    _config.palace_path,
+                    create,
+                )
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _metadata_cache = None
+                _metadata_cache_time = 0
+                _collection_open_error = {
+                    "error": "Backend open failed",
+                    "details": "Could not open the selected backend collection.",
+                    "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
+                }
+        return None
+
     for attempt in range(2):
         try:
+            if _collection_cache is not None and (
+                _collection_cache_backend not in (None, "chroma")
+                or _collection_cache_palace not in (None, _config.palace_path)
+            ):
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
             client = _get_client()
             # ChromaDB 1.x persists the EF *identity* (its ``name()``) with the
             # collection but not the EF *instance/configuration*. So a reader or
@@ -550,6 +682,9 @@ def _get_collection(create=False):
                     )
                 _pin_hnsw_threads(raw)
                 _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache_backend = "chroma"
+                _collection_cache_palace = _config.palace_path
+                _collection_open_error = None
                 _metadata_cache = None
                 _metadata_cache_time = 0
             elif _collection_cache is None:
@@ -558,9 +693,29 @@ def _get_collection(create=False):
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 _pin_hnsw_threads(raw)
                 _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache_backend = "chroma"
+                _collection_cache_palace = _config.palace_path
+                _collection_open_error = None
                 _metadata_cache = None
                 _metadata_cache_time = 0
             return _collection_cache
+        except (BackendMismatchError, KeyError) as exc:
+            _collection_open_error = {
+                "error": "Backend mismatch"
+                if isinstance(exc, BackendMismatchError)
+                else "Unknown backend",
+                "details": str(exc),
+                "hint": "Select the matching backend or use a fresh palace directory.",
+            }
+            _client_cache = None
+            _collection_cache = None
+            _collection_cache_backend = None
+            _collection_cache_palace = None
+            _palace_db_inode = 0
+            _palace_db_mtime = 0.0
+            _metadata_cache = None
+            _metadata_cache_time = 0
+            return None
         except Exception:
             logger.exception(
                 "_get_collection attempt %d/2 failed (palace=%s, create=%s)",
@@ -575,8 +730,30 @@ def _get_collection(create=False):
                 # collection cleanly, healing the common stale-handle case.
                 _client_cache = None
                 _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _palace_db_inode = 0
+                _palace_db_mtime = 0.0
                 _metadata_cache = None
                 _metadata_cache_time = 0
+                _collection_open_error = {
+                    "error": "Backend open failed",
+                    "details": "Could not open the Chroma collection.",
+                    "hint": "Run: mempalace repair-status for diagnostics.",
+                }
+    _client_cache = None
+    _collection_cache = None
+    _collection_cache_backend = None
+    _collection_cache_palace = None
+    _palace_db_inode = 0
+    _palace_db_mtime = 0.0
+    _metadata_cache = None
+    _metadata_cache_time = 0
+    _collection_open_error = _collection_open_error or {
+        "error": "Backend open failed",
+        "details": "Could not open the selected backend collection.",
+        "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
+    }
     return None
 
 
@@ -585,6 +762,42 @@ def _no_palace():
         "error": "No palace found",
         "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
     }
+
+
+def _collection_error_or_no_palace():
+    if not _collection_open_error:
+        return _no_palace()
+    result = dict(_collection_open_error)
+    try:
+        result["backend"] = _selected_backend_name()
+    except Exception:
+        pass
+    return result
+
+
+def _selected_backend_name() -> str:
+    from .palace import resolve_backend_name
+
+    return resolve_backend_name(
+        _config.palace_path,
+        explicit=os.environ.get("MEMPALACE_BACKEND_EXPLICIT"),
+    )
+
+
+def _is_chroma_backend() -> bool:
+    try:
+        return _selected_backend_name() == "chroma"
+    except Exception:
+        logger.debug("backend resolution failed", exc_info=True)
+        return False
+
+
+def _backend_db_exists() -> bool:
+    try:
+        return detect_backend_for_path(_config.palace_path) is not None
+    except Exception:
+        logger.debug("backend artifact detection failed", exc_info=True)
+        return False
 
 
 # ==================== HELPERS ====================
@@ -722,6 +935,7 @@ def _tool_status_via_sqlite() -> dict:
         "rooms": rooms,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
+        "backend": "chroma",
         "vector_disabled": True,
         "vector_disabled_reason": _vector_disabled_reason,
     }
@@ -739,7 +953,7 @@ def tool_status():
     # #1222 failure mode, opening the persistent client to call .count()
     # can segfault — short-circuit to a pure-sqlite path when divergence
     # is detected so status stays reachable.
-    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    db_exists = _backend_db_exists()
     _refresh_vector_disabled_flag()
 
     if _vector_disabled:
@@ -750,7 +964,7 @@ def tool_status():
     # accidentally creating a palace in a non-existent directory (#830).
     col = _get_collection(create=db_exists)
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     count = col.count()
     wings = {}
     rooms = {}
@@ -760,6 +974,7 @@ def tool_status():
         "rooms": rooms,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
+        "backend": _selected_backend_name(),
     }
     try:
         all_meta = _get_cached_metadata(col)
@@ -812,7 +1027,7 @@ When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 def tool_list_wings():
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     wings = {}
     result = {"wings": wings}
     try:
@@ -835,7 +1050,7 @@ def tool_list_rooms(wing: str = None):
         return {"error": str(e)}
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     rooms = {}
     result = {"wing": wing or "all", "rooms": rooms}
     try:
@@ -855,7 +1070,7 @@ def tool_list_rooms(wing: str = None):
 def tool_get_taxonomy():
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     taxonomy = {}
     result = {"taxonomy": taxonomy}
     try:
@@ -925,6 +1140,7 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            collection_name=_config.collection_name,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -963,7 +1179,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         }
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     try:
         content = strip_lone_surrogates(content)
         results = col.query(
@@ -1009,7 +1225,7 @@ def tool_traverse_graph(start_room: str, max_hops: int = 2):
     max_hops = max(1, min(max_hops, 10))
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     return traverse(start_room, col=col, max_hops=max_hops)
 
 
@@ -1022,7 +1238,7 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         return {"error": str(e)}
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     return find_tunnels(wing_a, wing_b, col=col)
 
 
@@ -1030,7 +1246,7 @@ def tool_graph_stats():
     """Palace graph overview: nodes, tunnels, edges, connectivity."""
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     return graph_stats(col=col)
 
 
@@ -1096,6 +1312,8 @@ def tool_follow_tunnels(wing: str, room: str):
     except ValueError as e:
         return {"error": str(e)}
     col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
     return follow_tunnels(wing, room, col=col)
 
 
@@ -1130,7 +1348,7 @@ def tool_add_drawer(
 
     col = _get_collection(create=True)
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
 
     drawer_id = (
         f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
@@ -1244,7 +1462,7 @@ def tool_delete_drawer(drawer_id: str):
     global _metadata_cache
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     existing = col.get(ids=[drawer_id])
     if not existing["ids"]:
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
@@ -1314,7 +1532,7 @@ def tool_get_drawer(drawer_id: str):
     """Fetch a single drawer by ID. Returns full content and metadata."""
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     try:
         result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
         if not result["ids"]:
@@ -1352,7 +1570,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         return {"error": str(e)}
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     try:
         where = None
         conditions = []
@@ -1409,7 +1627,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     try:
         existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
         if not existing["ids"]:
@@ -1627,7 +1845,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     room = "diary"
     col = _get_collection(create=True)
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
 
     now = datetime.now()
     entry_id = (
@@ -1750,7 +1968,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     last_n = max(1, min(last_n, 100))
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
 
     # Build filter: always scope by agent + room=diary. Wing is optional —
     # when empty, return entries across all wings for this agent (matches
@@ -1884,6 +2102,9 @@ def tool_reconnect():
     global \
         _client_cache, \
         _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error, \
         _palace_db_inode, \
         _palace_db_mtime, \
         _vector_disabled, \
@@ -1891,29 +2112,60 @@ def tool_reconnect():
     from . import palace as palace_module
 
     close_errors = []
+    palace_ref = PalaceRef(id=_config.palace_path, local_path=_config.palace_path)
+    closed_backend_names = set()
+    cached_backend_name = _collection_cache_backend
     try:
-        palace_module._DEFAULT_BACKEND.close_palace(_config.palace_path)
+        backend = palace_module.get_backend_for_palace(_config.palace_path)
+        backend.close_palace(palace_ref)
+        if getattr(backend, "name", None):
+            closed_backend_names.add(backend.name)
     except Exception as exc:
         logger.debug("Failed to close shared palace backend during reconnect", exc_info=True)
         close_errors.append(f"backend close_palace failed: {exc}")
-    try:
-        from chromadb.api.client import SharedSystemClient
+    if cached_backend_name and cached_backend_name not in closed_backend_names:
+        try:
+            from .backends import get_backend
 
-        clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
-        if callable(clear_system_cache):
-            clear_system_cache()
-        else:
+            get_backend(cached_backend_name).close_palace(palace_ref)
+            closed_backend_names.add(cached_backend_name)
+        except Exception as exc:
             logger.debug(
-                "SharedSystemClient.clear_system_cache is unavailable; skipping shared Chroma cache clear during reconnect"
+                "Failed to close previously cached %s backend during reconnect",
+                cached_backend_name,
+                exc_info=True,
             )
-    except Exception as exc:
-        logger.debug(
-            "Failed to clear Chroma shared system cache during reconnect",
-            exc_info=True,
-        )
-        close_errors.append(f"shared Chroma cache clear failed: {exc}")
+            close_errors.append(f"cached {cached_backend_name} close_palace failed: {exc}")
+    if _client_cache is not None:
+        try:
+            close = getattr(_client_cache, "close", None)
+            if callable(close):
+                close()
+        except Exception as exc:
+            logger.debug("Failed to close MCP-local Chroma client during reconnect", exc_info=True)
+            close_errors.append(f"local Chroma client close failed: {exc}")
+    if _is_chroma_backend():
+        try:
+            from chromadb.api.client import SharedSystemClient
+
+            clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
+            if callable(clear_system_cache):
+                clear_system_cache()
+            else:
+                logger.debug(
+                    "SharedSystemClient.clear_system_cache is unavailable; skipping shared Chroma cache clear during reconnect"
+                )
+        except Exception as exc:
+            logger.debug(
+                "Failed to clear Chroma shared system cache during reconnect",
+                exc_info=True,
+            )
+            close_errors.append(f"shared Chroma cache clear failed: {exc}")
     _client_cache = None
     _collection_cache = None
+    _collection_cache_backend = None
+    _collection_cache_palace = None
+    _collection_open_error = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
     # Force probe re-run on next _get_client by clearing the flag now;
@@ -1933,12 +2185,17 @@ def tool_reconnect():
     try:
         col = _get_collection()
         if col is None:
+            open_error = _collection_error_or_no_palace()
             result = {
                 "success": False,
-                "message": "No palace found after reconnect",
+                "message": open_error.get("error", "No palace found after reconnect"),
                 "drawers": 0,
                 "vector_disabled": _vector_disabled,
             }
+            if "details" in open_error:
+                result["details"] = open_error["details"]
+            if "hint" in open_error:
+                result["hint"] = open_error["hint"]
             if close_errors:
                 result["error"] = "; ".join(close_errors)
             return result
@@ -2724,8 +2981,17 @@ def _maybe_eager_warmup_embedder() -> None:
         )
         return
     palace_path = _config.palace_path
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
+    try:
+        backend_name = _selected_backend_name()
+    except Exception as exc:  # fail-soft per docstring
+        logger.warning(
+            "MEMPALACE_EAGER_WARMUP=%s: backend resolution failed for %s (%s)",
+            raw,
+            palace_path,
+            exc,
+        )
+        return
+    if not _backend_db_exists():
         # Pre-check (NOT a try/except on _ChromaNotFoundError, which never
         # propagates out of _get_collection — see docstring). No palace
         # file means nothing to warm AND avoids the chromadb-client
@@ -2769,9 +3035,11 @@ def _maybe_eager_warmup_embedder() -> None:
             type(exc).__name__,
         )
     else:
+        warmed = "embedder + HNSW ready" if backend_name == "chroma" else "embedder + backend ready"
         logger.info(
-            "MEMPALACE_EAGER_WARMUP=%s: embedder + HNSW ready (palace=%s, device=%s)",
+            "MEMPALACE_EAGER_WARMUP=%s: %s (palace=%s, device=%s)",
             raw,
+            warmed,
             palace_path,
             device,
         )

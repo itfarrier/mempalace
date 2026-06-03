@@ -69,6 +69,28 @@ python -m venv .venv && source .venv/bin/activate
 pip install mempalace
 ```
 
+## Storage backends
+
+ChromaDB is the default. For the pluggable-backend preview, MemPalace also
+ships `sqlite_exact` for local exact-vector correctness checks and `qdrant`
+for an opt-in Qdrant service backend.
+
+```bash
+# local no-service backend
+mempalace mine ~/projects/myapp --backend sqlite_exact
+
+# Qdrant backend, defaulting to http://localhost:6333
+MEMPALACE_QDRANT_URL=http://localhost:6333 \
+  mempalace mine ~/projects/myapp --backend qdrant
+```
+
+Qdrant can also be configured with `MEMPALACE_QDRANT_API_KEY`,
+`MEMPALACE_QDRANT_NAMESPACE`, and `MEMPALACE_QDRANT_TIMEOUT`.
+When `MEMPALACE_QDRANT_URL` points anywhere other than your own local or
+trusted self-hosted service, MemPalace will send and store verbatim drawer
+text and metadata there. That is an explicit opt-in backend choice, never
+the default.
+
 ## Quickstart
 
 ```bash
