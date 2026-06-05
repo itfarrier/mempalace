@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.7
+
+# MemPalace — GPU (NVIDIA CUDA) image.
+#
+# The `gpu` extra pulls onnxruntime-gpu, which needs CUDA + cuDNN shared
+# libraries at runtime, so this variant builds on an nvidia/cuda base instead
+# of python:slim. It is single-stage on purpose: the venv is created with a
+# uv-managed interpreter, and copying that interpreter cleanly across build
+# stages is more trouble than the size saving is worth for a GPU image.
+#
+# Build:
+#   docker build -f Dockerfile.gpu -t mempalace:gpu .
+#
+# Run (requires the NVIDIA Container Toolkit on the host):
+#   docker run -i --rm --gpus all \
+#     -e MEMPALACE_EMBEDDING_DEVICE=cuda \
+#     -v mempalace-data:/data mempalace:gpu
+#
+# NOTE: onnxruntime-gpu ties itself to a CUDA major version. If embeddings
+# fail to load on the GPU, align CUDA_IMAGE below with the CUDA release that
+# the resolved onnxruntime-gpu wheel targets (see its release notes), then
+# rebuild.
+
+ARG CUDA_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+FROM ${CUDA_IMAGE}
+
+LABEL org.opencontainers.image.title="MemPalace (GPU)" \
+      org.opencontainers.image.description="Local-first AI memory with CUDA-accelerated embeddings." \
+      org.opencontainers.image.source="https://github.com/MemPalace/mempalace" \
+      org.opencontainers.image.licenses="MIT"
+
+COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /uvx /bin/
+
+# Minimal toolchain for any source-built wheels; ca-certificates for the
+# lazy HuggingFace model download on first use.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG PYTHON_VERSION=3.12
+ARG EXTRAS="extract,spellcheck,gpu"
+
+ENV HOME=/data \
+    PATH="/app/.venv/bin:${PATH}" \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_PYTHON_PREFERENCE=only-managed \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MEMPALACE_EMBEDDING_DEVICE=cuda
+
+WORKDIR /app
+
+# uv-managed interpreter pinned to PYTHON_VERSION, installed to a stable path
+# so the venv stays valid at runtime.
+RUN uv python install ${PYTHON_VERSION}
+
+COPY . /app
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -e; \
+    flags=""; \
+    for e in $(echo "${EXTRAS}" | tr ',' ' '); do flags="${flags} --extra ${e}"; done; \
+    uv sync --frozen --no-dev --no-editable --python ${PYTHON_VERSION} ${flags}
+
+RUN groupadd --gid 1000 mempalace \
+    && useradd --uid 1000 --gid 1000 --home-dir /data --create-home mempalace \
+    && chown -R mempalace:mempalace /app /data
+
+COPY --chown=mempalace:mempalace docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+USER mempalace
+VOLUME ["/data"]
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["mcp"]

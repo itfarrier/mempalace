@@ -1,0 +1,30 @@
+# MemPalace via Docker Compose.
+#
+# The MCP server speaks JSON-RPC over stdio, so the `mcp` service is meant to
+# be driven interactively (`docker compose run`), not left running detached:
+#
+#   docker compose build
+#   docker compose run --rm mcp                       # MCP server over stdio
+#   docker compose run --rm mcp cli search "GraphQL"  # one-off CLI command
+#
+# The named volume `mempalace-data` is mounted at /data and holds the palace,
+# config, and the cached embedding model across runs.
+
+services:
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mempalace:local
+    # stdio transport: keep STDIN open and allocate no TTY (raw JSON-RPC).
+    stdin_open: true
+    tty: false
+    volumes:
+      - mempalace-data:/data
+    environment:
+      # Override the palace location, embedding model, etc. here if needed.
+      # - MEMPALACE_EMBEDDING_MODEL=minilm
+      MEMPALACE_PALACE_PATH: /data/.mempalace/palace
+
+volumes:
+  mempalace-data:
