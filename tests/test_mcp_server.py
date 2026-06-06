@@ -695,6 +695,75 @@ class TestReadTools:
         assert "project" in result["wings"]
         assert "notes" in result["wings"]
 
+    def test_status_sqlite_exact_backend_has_no_hnsw_fields(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        import mempalace.backends.embedding_wrapper as embedding_wrapper
+        from mempalace.palace import get_collection
+
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setattr(
+            embedding_wrapper,
+            "_embed_texts",
+            lambda texts: [[float(len(text)), 1.0] for text in texts],
+        )
+        col = get_collection(palace_path, create=True)
+        col.add(
+            ids=["drawer_sqlite"],
+            documents=["verbatim sqlite drawer"],
+            metadatas=[{"wing": "w", "room": "r"}],
+        )
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+        result = mcp_server.tool_status()
+
+        assert result["backend"] == "sqlite_exact"
+        assert result["total_drawers"] == 1
+        assert "hnsw_capacity" not in result
+        assert result.get("vector_disabled") is not True
+
+    def test_status_qdrant_backend_has_no_hnsw_fields(self, monkeypatch, config, palace_path, kg):
+        from mempalace.backends import GetResult
+
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "qdrant")
+        monkeypatch.setenv("MEMPALACE_BACKEND", "qdrant")
+        with open(os.path.join(palace_path, "qdrant_backend.json"), "w", encoding="utf-8") as f:
+            json.dump({"backend": "qdrant"}, f)
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        class _FakeQdrantCollection:
+            def count(self):
+                return 2
+
+            def get(self, **_kwargs):
+                return GetResult(
+                    ids=["q1", "q2"],
+                    documents=[],
+                    metadatas=[
+                        {"wing": "project", "room": "backend"},
+                        {"wing": "project", "room": "api"},
+                    ],
+                )
+
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+        monkeypatch.setattr(
+            mcp_server, "_get_collection", lambda create=False: _FakeQdrantCollection()
+        )
+
+        result = mcp_server.tool_status()
+
+        assert result["backend"] == "qdrant"
+        assert result["total_drawers"] == 2
+        assert result["wings"] == {"project": 2}
+        assert "hnsw_capacity" not in result
+        assert result.get("vector_disabled") is not True
+
     def test_status_handles_none_metadata_without_partial(
         self, monkeypatch, config, palace_path, kg
     ):
@@ -2290,7 +2359,69 @@ class TestCacheInvalidation:
 
         result = mcp_server.tool_reconnect()
         assert result["success"] is True
-        close_palace.assert_called_once_with(config.palace_path)
+        closed_ref = close_palace.call_args.args[0]
+        assert closed_ref.local_path == config.palace_path
+
+    def test_reconnect_closes_selected_non_chroma_backend(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        from mempalace import mcp_server, palace
+
+        closed = []
+
+        class _FakeBackend:
+            def close_palace(self, path):
+                closed.append(path)
+
+        class _FakeCol:
+            def count(self):
+                return 3
+
+        monkeypatch.setattr(palace, "get_backend_for_palace", lambda _path: _FakeBackend())
+        monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_reconnect()
+
+        assert result["success"] is True
+        assert result["drawers"] == 3
+        assert len(closed) == 1
+        assert closed[0].local_path == palace_path
+
+    def test_reconnect_closes_previously_cached_backend(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import backends, mcp_server, palace
+
+        closed = []
+
+        class _SelectedBackend:
+            name = "sqlite_exact"
+
+            def close_palace(self, ref):
+                closed.append(("selected", ref.local_path))
+
+        class _CachedBackend:
+            name = "chroma"
+
+            def close_palace(self, ref):
+                closed.append(("cached", ref.local_path))
+
+        class _FakeCol:
+            def count(self):
+                return 3
+
+        monkeypatch.setattr(palace, "get_backend_for_palace", lambda _path: _SelectedBackend())
+        monkeypatch.setattr(backends, "get_backend", lambda _name: _CachedBackend())
+        monkeypatch.setattr(mcp_server, "_collection_cache_backend", "chroma")
+        monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_reconnect()
+
+        assert result["success"] is True
+        assert closed == [("selected", palace_path), ("cached", palace_path)]
 
     def test_get_collection_create_true_avoids_get_or_create_on_reopen(
         self, monkeypatch, config, palace_path, kg
